@@ -23,16 +23,26 @@
 /* USER CODE BEGIN Includes */
 #include "sensor_types.h"
 #include <stdint.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct __attribute__((packed)) {
+	  uint8_t  error_code;
+	  uint32_t concenration_value;
+	  uint16_t temperature_value;
+	  uint8_t  humidity_value;
+	  uint16_t raw_signal;
+} expected_reply_over_uart_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define START_OF_UART_RX_FRAME_INDEX_CHECK_NO_1 (0)
+#define START_OF_UART_RX_FRAME_INDEX_CHECK_NO_2 (1)
+#define END_OF_UART_RX_FRAME_INDEX_CHECK (18)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -75,13 +85,7 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, ui
   uint8_t const uart_cmd_byte_string[] = { 0xFB, 0x68, 0x08, 0x00, 0x00, 0x40, 0x00, 0x1F, 0x19, 0xF0, 0xFC };
   //HAL_StatusTypeDef i2c_status;
   uint8_t const start_of_data_offset = 6u;
-  struct expected_reply_over_uart_s {
-	  uint32_t concenration_value;
-	  uint16_t temperature_value;
-	  uint8_t  error_code;
-	  uint8_t  humidity_value;
-	  uint16_t raw_signal;
-  } expected_reply_over_uart;
+  expected_reply_over_uart_t expected_reply_over_uart = { 0 };
   uint32_t uart_reply_errors_detected = 0uL;
   /* When master reads from slave, transmit latest ADC sample */
   if (TransferDirection == I2C_DIRECTION_RECEIVE) {
@@ -97,33 +101,41 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, ui
 			  Error_Handler();
 			  break;
 		  }
-		  expected_reply_over_uart = *(struct expected_reply_over_uart_s*)&uart_rx_buffer[start_of_data_offset];
+		  else if ((0xFB == uart_rx_buffer[START_OF_UART_RX_FRAME_INDEX_CHECK_NO_1]) &&
+				   (0x68 == uart_rx_buffer[START_OF_UART_RX_FRAME_INDEX_CHECK_NO_2]) &&
+				   (0xFC == uart_rx_buffer[END_OF_UART_RX_FRAME_INDEX_CHECK])) {
+			  (void)memcpy((void*)&expected_reply_over_uart, (void const*)&uart_rx_buffer[start_of_data_offset], sizeof(expected_reply_over_uart_t));
 
-		  if (UART_RESPONSE_NO_ERROR == expected_reply_over_uart.error_code) {
-			  expected_reply_over_uart.concenration_value /= 100;
-			  expected_reply_over_uart.temperature_value /= 10;
-			  expected_reply_over_uart.temperature_value -= 127;
-		  }
-		  else {
-			  if (++uart_reply_errors_detected > 100) {
-				  Error_Handler();
+			  if (UART_RESPONSE_NO_ERROR == expected_reply_over_uart.error_code) {
+				  expected_reply_over_uart.concenration_value /= 100;
+				  expected_reply_over_uart.temperature_value /= 10;
+				  expected_reply_over_uart.temperature_value -= 127;
 			  }
-			  //HAL_Delay(1000); // delay of 1 Sec before repeating the transmission.
+			  else {
+				  if (++uart_reply_errors_detected > 100) {
+					  Error_Handler();
+				  }
+				  //HAL_Delay(1000); // delay of 1 Sec before repeating the transmission.
+			  }
 		  }
 	  } while (0); // Do this once ! (we are in a callback context)   UART_RESPONSE_NO_ERROR != expected_reply_over_uart.error_code);
 	  uint8_t i2cBuffOffset = 0u;
       i2cTxBuf[i2cBuffOffset++] = GetSensorBoardId();
-      *(uint32_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.concenration_value;
-      i2cBuffOffset += sizeof(uint32_t);
-      *(uint16_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.temperature_value;
-      i2cBuffOffset += sizeof(uint16_t);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.concenration_value >> 24) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.concenration_value >> 16) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.concenration_value >>  8) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.concenration_value) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.temperature_value >>  8) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.temperature_value) & 0xFF);
       i2cTxBuf[i2cBuffOffset++] = expected_reply_over_uart.humidity_value;
-      *(uint16_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.raw_signal;
-      i2cBuffOffset += sizeof(uint16_t);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.raw_signal >>  8) & 0xFF);
+      i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.raw_signal) & 0xFF);
 #warning:"REMEMBER TO READ THE ADC !"
       i2cTxBuf[i2cBuffOffset++] = 0xDE;
       i2cTxBuf[i2cBuffOffset]   = 0xAD;
-      HAL_I2C_Slave_Seq_Transmit_IT(hi2c, i2cTxBuf, sizeof(i2cTxBuf), I2C_LAST_FRAME);
+      if (HAL_OK != HAL_I2C_Slave_Seq_Transmit_IT(hi2c, i2cTxBuf, sizeof(i2cTxBuf), I2C_LAST_FRAME)) {
+    	  Error_Handler();
+      }
   } else {
     /* Master writing to us: just prepare to receive and ignore */
     HAL_I2C_Slave_Seq_Receive_IT(hi2c, &i2cDummyRx, 1, I2C_LAST_FRAME);
@@ -201,8 +213,9 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	  just_ticks++;
+
     /* USER CODE BEGIN 3 */
+	  just_ticks++;
   }
   /* USER CODE END 3 */
 }
@@ -215,7 +228,6 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
   __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
 
   /** Initializes the RCC Oscillators according to the specified parameters
@@ -322,7 +334,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00201D2B;
+  hi2c1.Init.Timing = 0x2000090E;
   hi2c1.Init.OwnAddress1 = (THIS_SENSOR_BOARD_I2C_ADDRESS << 1);
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
