@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "sensor_types.h"
 #include <stdint.h>
 /* USER CODE END Includes */
 
@@ -36,7 +37,7 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define UART_RESPONSE_NO_ERROR (0x00)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -47,6 +48,13 @@ I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+uint16_t uart_expected_length = 19u;
+uint8_t  uart_rx_buffer[32] = { 0u };
+uint8_t  i2c_slave_cmd_expected_length = 0xFE;
+uint8_t  i2c_slave_rx_buffer[64] = { 0u };
+uint32_t i2c_errors = 0uL;
+static uint8_t i2cTxBuf[12];
+static uint8_t i2cDummyRx;
 
 /* USER CODE END PV */
 
@@ -58,11 +66,94 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
+void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, uint16_t AddrMatchCode)
+{
+  (void)AddrMatchCode;
+  if (hi2c->Instance != I2C1) {
+    return;
+  }
+  uint8_t const uart_cmd_byte_string[] = { 0xFB, 0x68, 0x08, 0x00, 0x00, 0x40, 0x00, 0x1F, 0x19, 0xF0, 0xFC };
+  //HAL_StatusTypeDef i2c_status;
+  uint8_t const start_of_data_offset = 6u;
+  struct expected_reply_over_uart_s {
+	  uint32_t concenration_value;
+	  uint16_t temperature_value;
+	  uint8_t  error_code;
+	  uint8_t  humidity_value;
+	  uint16_t raw_signal;
+  } expected_reply_over_uart;
+  uint32_t uart_reply_errors_detected = 0uL;
+  /* When master reads from slave, transmit latest ADC sample */
+  if (TransferDirection == I2C_DIRECTION_RECEIVE) {
+	  do {
+		  HAL_StatusTypeDef uart_status = HAL_UART_Transmit(&huart1, uart_cmd_byte_string, (uint16_t)sizeof(uart_cmd_byte_string), 10);
+
+		  if (HAL_OK != uart_status) {
+			  Error_Handler();
+			  break;
+		  }
+		  uart_status = HAL_UART_Receive(&huart1, uart_rx_buffer, uart_expected_length, 50);
+		  if (HAL_OK != uart_status) {
+			  Error_Handler();
+			  break;
+		  }
+		  expected_reply_over_uart = *(struct expected_reply_over_uart_s*)&uart_rx_buffer[start_of_data_offset];
+
+		  if (UART_RESPONSE_NO_ERROR == expected_reply_over_uart.error_code) {
+			  expected_reply_over_uart.concenration_value /= 100;
+			  expected_reply_over_uart.temperature_value /= 10;
+			  expected_reply_over_uart.temperature_value -= 127;
+		  }
+		  else {
+			  if (++uart_reply_errors_detected > 100) {
+				  Error_Handler();
+			  }
+			  //HAL_Delay(1000); // delay of 1 Sec before repeating the transmission.
+		  }
+	  } while (0); // Do this once ! (we are in a callback context)   UART_RESPONSE_NO_ERROR != expected_reply_over_uart.error_code);
+	  uint8_t i2cBuffOffset = 0u;
+      i2cTxBuf[i2cBuffOffset++] = GetSensorBoardId();
+      *(uint32_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.concenration_value;
+      i2cBuffOffset += sizeof(uint32_t);
+      *(uint16_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.temperature_value;
+      i2cBuffOffset += sizeof(uint16_t);
+      i2cTxBuf[i2cBuffOffset++] = expected_reply_over_uart.humidity_value;
+      *(uint16_t*)&i2cTxBuf[i2cBuffOffset] = expected_reply_over_uart.raw_signal;
+      i2cBuffOffset += sizeof(uint16_t);
+#warning:"REMEMBER TO READ THE ADC !"
+      i2cTxBuf[i2cBuffOffset++] = 0xDE;
+      i2cTxBuf[i2cBuffOffset]   = 0xAD;
+      HAL_I2C_Slave_Seq_Transmit_IT(hi2c, i2cTxBuf, sizeof(i2cTxBuf), I2C_LAST_FRAME);
+  } else {
+    /* Master writing to us: just prepare to receive and ignore */
+    HAL_I2C_Slave_Seq_Receive_IT(hi2c, &i2cDummyRx, 1, I2C_LAST_FRAME);
+  }
+}
+
+void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1) {
+    /* Restart listening to handle next transaction */
+    HAL_I2C_EnableListen_IT(hi2c);
+  }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1) {
+    /* Recover by re-enabling listen */
+    HAL_I2C_EnableListen_IT(hi2c);
+  }
+}
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint32_t ticks_without_i2c_comm = 0uL;
+uint32_t uart_reply_errors_detected = 0uL;
 
+uint32_t recorded_errors = 0uL;
 /* USER CODE END 0 */
 
 /**
@@ -98,27 +189,19 @@ int main(void)
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t expected_length = 19u;
-  uint8_t rx_buffer[32] = { 0u };
+
+  /* Start listening as I2C slave */
+  HAL_I2C_EnableListen_IT(&hi2c1);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t just_ticks = 0uL;
   while (1)
   {
     /* USER CODE END WHILE */
-	  uint8_t cmd_byte_string[] = { 0xFB, 0x68, 0x08, 0x00, 0x00, 0x40, 0x00, 0x1F, 0x19, 0xF0, 0xFC };
-	  HAL_StatusTypeDef uart_status = HAL_UART_Transmit(&huart1, cmd_byte_string, sizeof(cmd_byte_string), 10);
-	  if (HAL_OK != uart_status) {
-		  Error_Handler();
-	  }
-	  uart_status = HAL_UART_Receive(&huart1, rx_buffer, expected_length, 50);
-	  if (HAL_OK != uart_status) {
-		  Error_Handler();
-	  }
-	  else {
-		  HAL_Delay(1000); // delay of 1 Sec before repeating the transmission.
-	  }
+	  just_ticks++;
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -132,6 +215,8 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_0);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -237,8 +322,8 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x2000090E;
-  hi2c1.Init.OwnAddress1 = THIS_SENSOR_BOARD_I2C_ADDRESS;
+  hi2c1.Init.Timing = 0x00201D2B;
+  hi2c1.Init.OwnAddress1 = (THIS_SENSOR_BOARD_I2C_ADDRESS << 1);
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
@@ -348,7 +433,6 @@ static void MX_GPIO_Init(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-	static uint32_t recorded_errors = 0uL;
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)

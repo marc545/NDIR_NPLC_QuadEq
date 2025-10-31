@@ -6,5 +6,15 @@
  */
 #include "sensor_types.h"
 
-uint8_t const sensor_type_id = THIS_SENSOR_BOARD_ID;
-uint8_t const sensor_i2c_addr = THIS_SENSOR_BOARD_I2C_ADDRESS;
+static uint8_t const sensor_type_id = THIS_SENSOR_BOARD_ID;
+static uint8_t const sensor_i2c_addr = THIS_SENSOR_BOARD_I2C_ADDRESS;
+
+uint8_t GetSensorBoardId(void)
+{
+	return sensor_type_id;
+}
+
+uint8_t GetSensorBoardI2Caddress(void)
+{
+	return sensor_i2c_addr;
+}
