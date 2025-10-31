@@ -75,6 +75,7 @@ static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static uint16_t read_adc12_once(void);
 
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, uint16_t AddrMatchCode)
 {
@@ -130,9 +131,10 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, ui
       i2cTxBuf[i2cBuffOffset++] = expected_reply_over_uart.humidity_value;
       i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.raw_signal >>  8) & 0xFF);
       i2cTxBuf[i2cBuffOffset++] = ((expected_reply_over_uart.raw_signal) & 0xFF);
-#warning:"REMEMBER TO READ THE ADC !"
-      i2cTxBuf[i2cBuffOffset++] = 0xDE;
-      i2cTxBuf[i2cBuffOffset]   = 0xAD;
+
+      uint16_t adc = read_adc12_once();
+      i2cTxBuf[i2cBuffOffset++] = ((adc >> 8) & 0xFF);
+      i2cTxBuf[i2cBuffOffset]   = (adc & 0xFF);
       if (HAL_OK != HAL_I2C_Slave_Seq_Transmit_IT(hi2c, i2cTxBuf, sizeof(i2cTxBuf), I2C_LAST_FRAME)) {
     	  Error_Handler();
       }
@@ -156,6 +158,18 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
     /* Recover by re-enabling listen */
     HAL_I2C_EnableListen_IT(hi2c);
   }
+}
+
+static uint16_t read_adc12_once(void)
+{
+  uint16_t value = 0;
+  if (HAL_ADC_Start(&hadc1) == HAL_OK) {
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+      value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    }
+    HAL_ADC_Stop(&hadc1);
+  }
+  return value;
 }
 
 /* USER CODE END PFP */
@@ -209,7 +223,7 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t just_ticks = 0uL;
+  volatile uint32_t just_ticks = 0uL;
   while (1)
   {
     /* USER CODE END WHILE */
