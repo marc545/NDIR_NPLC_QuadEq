@@ -18,3 +18,13 @@ uint8_t GetSensorBoardI2Caddress(void)
 {
 	return sensor_i2c_addr;
 }
+
+uint8_t GetSensorBoardIdMajor(void)
+{
+	return THIS_SENSOR_BOARD_ID_MAJOR;
+}
+
+uint8_t GetSensorBoardIdMinor(void)
+{
+	return THIS_SENSOR_BOARD_ID_MINOR;
+}
