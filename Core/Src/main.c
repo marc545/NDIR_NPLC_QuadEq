@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include "stm32c0xx_hal_flash.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,8 +45,16 @@
 #define UART_RESPONSE_NO_ERROR (0x00)
 #define I2C_CMD_ZERO_SENSOR     (0x01)  // I2C command byte to trigger zero sensor calibration
 #define I2C_CMD_SPAN_SENSOR     (0x02)  // I2C command byte to trigger span sensor calibration
-#define I2C_CMD_ZERO_CALCCONC   (0x05)  // I2C command: zero CalcConc (subtract current CalcConc from coeff_c, RAM only; lost on power loss)
+#define I2C_CMD_ZERO_CALCCONC   (0x05)  // I2C command: zero CalcConc (adjust coeff_c to zero CalcConc, stored in Flash)
 #define CAL_STATUS_INVALID_MARKER 0xFF  // Marker value to indicate calibration status is not valid (display as "xxxx")
+
+// Flash storage for coeff_c (stored in last Flash page)
+// STM32C0 requires 8-byte (double word) alignment for Flash programming
+#define FLASH_COEFF_C_MAGIC     0x434F4546UL  // Magic number: "COEF" in ASCII
+#define FLASH_COEFF_C_PAGE      15U           // Use last page (page 15) for storage
+#define FLASH_COEFF_C_ADDRESS   (FLASH_BASE + (FLASH_COEFF_C_PAGE * FLASH_PAGE_SIZE))  // Address in last page (must be 8-byte aligned)
+#define FLASH_COEFF_C_MAGIC_OFFSET  0   // Magic number at offset 0 (first 4 bytes)
+#define FLASH_COEFF_C_VALUE_OFFSET  4   // coeff_c float value at offset 4 (next 4 bytes)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -69,7 +78,7 @@ static volatile uint8_t zero_sensor_pending = 0u;  // Flag to indicate zero sens
 static volatile uint8_t span_sensor_pending = 0u;  // Flag to indicate span sensor command needs to be processed in main loop
 static volatile uint8_t zero_calc_conc_pending = 0u;  // Flag: Zero CalcConc command received, process in main loop
 static int32_t last_calc_conc_avg = 0;  // Last CalcConc written to I2C buffer; used when Zero CalcConc runs (signed 32-bit)
-static float coeff_c_rw;  // Runtime coeff_c; init = default from sensor_types.h; Zero CalcConc: coeff_c_rw -= current_CalcConc
+static float coeff_c_rw;  // Runtime coeff_c; init from Flash (or default if Flash is empty); Zero CalcConc adjusts and saves to Flash
 static uint8_t span_value_bytes[4] = { 0u };  // Buffer to receive 4-byte span value from I2C master
 static volatile uint8_t waiting_for_span_bytes = 0u;  // Flag to indicate we're waiting for span data bytes
 static uint32_t polling_suspend_until = 0uL;  // Timestamp when polling should resume (0 = not suspended)
@@ -111,6 +120,8 @@ static uint16_t crc16_custom(const uint8_t *data, uint16_t len);
 static void send_span_sensor_command(const uint8_t *span_bytes);
 static uint8_t receive_calibration_response(void);
 static void send_zero_sensor_sequence(void);
+static uint8_t read_coeff_c_from_flash(float *coeff_c);
+static uint8_t write_coeff_c_to_flash(float coeff_c);
 
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, uint16_t AddrMatchCode)
 {
@@ -218,6 +229,66 @@ static uint16_t read_adc12_once(void)
     HAL_ADC_Stop(&hadc1);
   }
   return value;
+}
+
+// Read coeff_c from Flash memory
+// Returns 1 if valid data found, 0 if Flash is empty/invalid (use default)
+static uint8_t read_coeff_c_from_flash(float *coeff_c)
+{
+  uint32_t magic = *(volatile uint32_t*)(FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_MAGIC_OFFSET);
+  float stored_value = *(volatile float*)(FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_VALUE_OFFSET);
+  
+  // Check if magic number matches (valid data)
+  if (magic == FLASH_COEFF_C_MAGIC) {
+    *coeff_c = stored_value;
+    return 1u;  // Valid data found
+  }
+  
+  return 0u;  // Flash is empty or invalid, use default
+}
+
+// Write coeff_c to Flash memory
+// Returns 1 on success, 0 on failure
+// Note: STM32C0 requires 8-byte (double word) programming
+static uint8_t write_coeff_c_to_flash(float coeff_c)
+{
+  FLASH_EraseInitTypeDef EraseInitStruct;
+  uint32_t PageError = 0;
+  HAL_StatusTypeDef status;
+  uint32_t magic = FLASH_COEFF_C_MAGIC;
+  uint32_t value_as_uint32;
+  uint64_t double_word_data;
+  
+  // Unlock Flash
+  if (HAL_FLASH_Unlock() != HAL_OK) {
+    return 0u;
+  }
+  
+  // Erase the page containing coeff_c
+  EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
+  EraseInitStruct.Page = FLASH_COEFF_C_PAGE;
+  EraseInitStruct.NbPages = 1;
+  
+  status = HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
+  if (status != HAL_OK) {
+    HAL_FLASH_Lock();
+    return 0u;
+  }
+  
+  // Combine magic number and coeff_c into a 64-bit double word
+  // Lower 32 bits: magic number, Upper 32 bits: coeff_c float value
+  memcpy(&value_as_uint32, &coeff_c, sizeof(float));
+  double_word_data = ((uint64_t)value_as_uint32 << 32) | (uint64_t)magic;
+  
+  // Program as double word (8 bytes) at 8-byte aligned address
+  status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, 
+                              FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_MAGIC_OFFSET, 
+                              double_word_data);
+  
+  // Lock Flash
+  HAL_FLASH_Lock();
+  
+  return (status == HAL_OK) ? 1u : 0u;
 }
 
 /* USER CODE END PFP */
@@ -692,8 +763,11 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Always use default coeff_c at power-up (RAM-only; Zero CalcConc adjusts it until power loss) */
-  coeff_c_rw = sensor_quadratic_coeffs.coeff_c;
+  /* Load coeff_c from Flash (or use default if Flash is empty/invalid) */
+  if (!read_coeff_c_from_flash(&coeff_c_rw)) {
+    // Flash is empty or invalid - use default value (first time only)
+    coeff_c_rw = sensor_quadratic_coeffs.coeff_c;
+  }
 
   /* Initialize I2C TX buffer with Board ID (2 bytes) */
   i2cTxBuf[0] = GetSensorBoardIdMajor();
@@ -758,10 +832,18 @@ int main(void)
         polling_suspend_until = HAL_GetTick() + 60000uL;
       }
 
-      /* Handle Zero CalcConc command: subtract current CalcConc from coeff_c (RAM only; lost on power loss) */
+      /* Handle Zero CalcConc command: adjust coeff_c to zero CalcConc and save to Flash */
       if (zero_calc_conc_pending && !i2c_busy) {
         zero_calc_conc_pending = 0u;
-        coeff_c_rw -= (float)last_calc_conc_avg;
+        
+        // Calculate adjustment needed to zero CalcConc
+        // To zero CalcConc: new_coeff_c = old_coeff_c - CalcConc
+        // This works for both positive and negative CalcConc values
+        float adjustment = -(float)last_calc_conc_avg;
+        coeff_c_rw += adjustment;  // Add adjustment (subtract if CalcConc is positive, add if negative)
+        
+        // Save updated coeff_c to Flash (non-volatile storage)
+        write_coeff_c_to_flash(coeff_c_rw);
       }
       
       /* Update I2C TX buffer periodically (e.g., every 500 ms) to keep buffer fresh */

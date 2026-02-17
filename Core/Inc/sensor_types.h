@@ -29,7 +29,7 @@ enum gas_sensor_i2c_addr_range_e {
 // Board identifier (2 bytes: major.minor format, e.g., 0x86 0x40 = "86-40")
 // TODO: Set these values for each board (e.g., 86-40, 86-41, 86-42, 86-43)
 #define THIS_SENSOR_BOARD_ID_MAJOR     0x86  // First part of board ID (e.g., "86" in "86-40")
-#define THIS_SENSOR_BOARD_ID_MINOR     0x44  // Second part of board ID (e.g., "40" in "86-40")
+#define THIS_SENSOR_BOARD_ID_MINOR     0x37  // Second part of board ID (e.g., "40" in "86-40")
 
 // Quadratic equation coefficients for Absorptivity to CalcConc conversion
 // These are unique per sensor board and should be calibrated for each sensor
