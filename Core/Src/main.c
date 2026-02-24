@@ -69,7 +69,7 @@ uint8_t  uart_rx_buffer[32] = { 0u };  // Buffer for BLDM sensor response (23 by
 uint8_t  i2c_slave_cmd_expected_length = 0xFE;
 uint8_t  i2c_slave_rx_buffer[64] = { 0u };
 uint32_t i2c_errors = 0uL;
-static uint8_t i2cTxBuf[19];  // 19 data bytes (BoardID[2] + Concentration + Temperature + Humidity + Absorptivity + ADC + Calibration Status Byte7 + Calibration Status Byte8 + CalcConc)
+static uint8_t i2cTxBuf[21];  // 21 bytes: 19 payload (BoardID[2] + Concentration[4] + Temperature[2] + Humidity[1] + Absorptivity[2] + ADC[2] + CalStatus[2] + CalcConc[4]) + CRC16[2]
 static uint8_t i2cDummyRx;
 static volatile uint8_t i2c_data_ready = 0u;
 static uint8_t i2c_cmd_byte = 0u;  // Buffer to receive I2C write command byte
@@ -137,7 +137,7 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection, ui
   
   /* When master reads from slave, transmit buffer */
   if (TransferDirection == I2C_DIRECTION_RECEIVE) {
-      /* Normal sensor data - transmit pre-built buffer (19 bytes: 2 board ID + 12 sensor data + 2 calibration status + 4 CalcConc) */
+      /* Normal sensor data - transmit pre-built buffer (21 bytes: 19 payload + CRC-16) */
       if (HAL_OK != HAL_I2C_Slave_Seq_Transmit_IT(hi2c, i2cTxBuf, sizeof(i2cTxBuf), I2C_LAST_FRAME)) {
           i2c_busy = 0u;
           i2c_errors++;  // Diagnostic: track transmit errors
@@ -393,8 +393,14 @@ static void BuildI2CTxBuf(void)
   memcpy(&absorptivity_float, &uart_rx_buffer[15], 4);
   
   // Convert floats to integer values for I2C transmission
-  // Concentration: float -> uint32_t (in ppm, multiply by 100 to preserve 2 decimal places)
-  uint32_t concentration_value = (uint32_t)(concentration_float * 100.0f + 0.5f);
+  // Concentration: float -> int32_t (signed, ppm × 100 for 2 decimal places; negative allowed)
+  float concentration_scaled = concentration_float * 100.0f;
+  if (concentration_scaled > (float)INT32_MAX) {
+    concentration_scaled = (float)INT32_MAX;
+  } else if (concentration_scaled < (float)INT32_MIN) {
+    concentration_scaled = (float)INT32_MIN;
+  }
+  int32_t concentration_value = (int32_t)roundf(concentration_scaled);
   
   // Temperature: float -> uint16_t (in degrees C, multiply by 10 to preserve 1 decimal place)
   // Temperature can be negative, so we'll use offset encoding: add 1000 to make it always positive
@@ -419,10 +425,12 @@ static void BuildI2CTxBuf(void)
   // Write board identifier (2 bytes: major.minor, e.g., 0x86 0x40 = "86-40")
   i2cTxBuf[o++] = GetSensorBoardIdMajor();  // Value 1: Board ID Major
   i2cTxBuf[o++] = GetSensorBoardIdMinor();  // Value 2: Board ID Minor
-  i2cTxBuf[o++] = (uint8_t)((concentration_value >> 24) & 0xFF);  // Value 3: Concentration (MSB)
-  i2cTxBuf[o++] = (uint8_t)((concentration_value >> 16) & 0xFF);
-  i2cTxBuf[o++] = (uint8_t)((concentration_value >>  8) & 0xFF);
-  i2cTxBuf[o++] = (uint8_t)((concentration_value      ) & 0xFF);  // (LSB)
+  // Concentration: signed 32-bit big-endian (two's complement)
+  uint32_t concentration_bits = (uint32_t)concentration_value;
+  i2cTxBuf[o++] = (uint8_t)((concentration_bits >> 24) & 0xFF);  // Value 3: Concentration (MSB)
+  i2cTxBuf[o++] = (uint8_t)((concentration_bits >> 16) & 0xFF);
+  i2cTxBuf[o++] = (uint8_t)((concentration_bits >>  8) & 0xFF);
+  i2cTxBuf[o++] = (uint8_t)( concentration_bits        & 0xFF);   // (LSB)
   i2cTxBuf[o++] = (uint8_t)((temperature_value >> 8) & 0xFF);  // Value 4: Temperature (MSB)
   i2cTxBuf[o++] = (uint8_t)((temperature_value     ) & 0xFF);  // (LSB)
   i2cTxBuf[o++] = humidity_value;  // Value 5: Humidity
@@ -452,6 +460,11 @@ static void BuildI2CTxBuf(void)
   i2cTxBuf[o++] = (uint8_t)((calc_conc >> 16) & 0xFF);  // Byte 16: CalcConc byte 2
   i2cTxBuf[o++] = (uint8_t)((calc_conc >>  8) & 0xFF);  // Byte 17: CalcConc byte 3
   i2cTxBuf[o++] = (uint8_t)( calc_conc        & 0xFF);   // Byte 18: CalcConc LSB
+
+  // CRC-16 over bytes 0-18 (polynomial 0x8005, init 0x0000); result in bytes 19-20 big-endian
+  uint16_t crc = crc16_custom(i2cTxBuf, 19);
+  i2cTxBuf[19] = (uint8_t)((crc >> 8) & 0xFF);  // CRC MSB
+  i2cTxBuf[20] = (uint8_t)( crc       & 0xFF);  // CRC LSB
 
   i2c_data_ready = 1u;
 }
@@ -772,13 +785,13 @@ int main(void)
   /* Initialize I2C TX buffer with Board ID (2 bytes) */
   i2cTxBuf[0] = GetSensorBoardIdMajor();
   i2cTxBuf[1] = GetSensorBoardIdMinor();
-  for (uint8_t i = 2; i < 18; i++) {
-    i2cTxBuf[i] = 0;  // Clear sensor data bytes (up to CalcConc)
+  for (uint8_t i = 2; i < 21; i++) {
+    i2cTxBuf[i] = 0;  // Clear sensor data bytes and CRC
   }
   // Initialize calibration status bytes to invalid marker (will display as "xxxx")
   i2cTxBuf[13] = CAL_STATUS_INVALID_MARKER;
   i2cTxBuf[14] = CAL_STATUS_INVALID_MARKER;
-  // Initialize CalcConc to zero (bytes 15-18 after board ID[2] + data[13] + cal status[2])
+  // Initialize CalcConc to zero (bytes 15-18); bytes 19-20 are CRC (0 until BuildI2CTxBuf runs)
   i2cTxBuf[15] = 0;
   i2cTxBuf[16] = 0;
   i2cTxBuf[17] = 0;
