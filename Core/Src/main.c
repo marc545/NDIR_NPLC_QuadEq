@@ -232,19 +232,23 @@ static uint16_t read_adc12_once(void)
 }
 
 // Read coeff_c from Flash memory
-// Returns 1 if valid data found, 0 if Flash is empty/invalid (use default)
+// If flash contains valid data (magic matches) and value is finite, use it;
+// otherwise use default (avoids NaN/Inf or garbage from corrupted flash).
+// Returns 1 if magic matched (value may have been replaced with default if not finite), 0 otherwise.
 static uint8_t read_coeff_c_from_flash(float *coeff_c)
 {
   uint32_t magic = *(volatile uint32_t*)(FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_MAGIC_OFFSET);
-  float stored_value = *(volatile float*)(FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_VALUE_OFFSET);
   
-  // Check if magic number matches (valid data)
   if (magic == FLASH_COEFF_C_MAGIC) {
-    *coeff_c = stored_value;
-    return 1u;  // Valid data found
+    *coeff_c = *(volatile float*)(FLASH_COEFF_C_ADDRESS + FLASH_COEFF_C_VALUE_OFFSET);
+    // If not finite (NaN, Inf, corrupted), use default so CalcConc is always valid
+    if (!isfinite(*coeff_c)) {
+      *coeff_c = sensor_quadratic_coeffs.coeff_c;
+    }
+    return 1u;
   }
   
-  return 0u;  // Flash is empty or invalid, use default
+  return 0u;  // Flash empty or invalid, use default (caller assigns)
 }
 
 // Write coeff_c to Flash memory
